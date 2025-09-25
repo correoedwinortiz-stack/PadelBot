@@ -6,7 +6,10 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 
 # --- CONFIGURACIÓN ---
 load_dotenv()  # Carga variables del archivo .env
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+import os
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
 if not TELEGRAM_TOKEN:
     raise ValueError("❌ No se encontró TELEGRAM_TOKEN. ¿Lo pusiste en .env?")
 
