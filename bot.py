@@ -1,15 +1,11 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 
 
-import os
-import httpx
-import asyncio
-from flask import Flask
-import threading
+from aiohttp import web  # Usamos aiohttp en lugar de Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN (sin cambios ) ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PADEL_API_URL = "https://fantasy-padel-tour-api.onrender.com/api"
 
@@ -30,12 +26,9 @@ async def get_padel_rankings(gender: str) -> str:
             points = player.get("points", 0)
             message += f"**{rank}.** {name} - `{points}` pts\n"
         return message
-    except httpx.RequestError as e:
-        print(f"Error al contactar la API de pádel: {e}")
-        return "Lo siento, no pude contactar al proveedor de datos de pádel en este momento."
     except Exception as e:
-        print(f"Ocurrió un error inesperado al procesar los rankings: {e}")
-        return "Ocurrió un error inesperado al obtener los rankings."
+        print(f"Error al obtener rankings: {e}")
+        return "Lo siento, ocurrió un error al obtener los rankings."
 
 
 # --- LÓGICA DEL BOT DE TELEGRAM (sin cambios) ---
@@ -107,47 +100,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-# --- NUEVA PARTE: EL SERVIDOR WEB FALSO ---
-app = Flask(__name__)
+# --- NUEVA ESTRUCTURA PRINCIPAL ASÍNCRONA ---
 
 
-@app.route("/")
-def index():
-    # Esta es la "página principal" que Render verá.
-    # Simplemente devuelve un mensaje para confirmar que el servidor está vivo.
-    return "El servidor web está activo, pero el bot se ejecuta en segundo plano."
+async def main():
+    """Configura e inicia el bot y el servidor web de forma concurrente."""
 
-
-def run_flask_app():
-    # Ejecuta el servidor Flask en el puerto que Render nos asigne.
-    # Render asigna el puerto a través de la variable de entorno PORT.
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-
-# --- FUNCIÓN PRINCIPAL MODIFICADA ---
-def main() -> None:
-    """Inicia el bot y el servidor web."""
-    print("Iniciando bot...")
+    # --- Configuración del Bot de Telegram ---
     if not TELEGRAM_TOKEN:
         print("Error: No se encontró el TELEGRAM_TOKEN.")
         return
 
-    # Inicia el servidor Flask en un hilo separado
-    flask_thread = threading.Thread(target=run_flask_app)
-    flask_thread.daemon = True
-    flask_thread.start()
-    print("Servidor web falso iniciado en un hilo.")
-
-    # Configura y ejecuta el bot de Telegram
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    print("El bot está en línea. Escuchando peticiones...")
-    # Usamos run_polling en el hilo principal
-    application.run_polling()
+    # --- Configuración del Servidor Web aiohttp ---
+    app = web.Application()
+
+    # Ruta principal que Render verificará
+    async def health_check(request):
+        return web.Response(text="El bot está activo y escuchando.")
+
+    app.router.add_get("/", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # Render nos da el puerto a través de la variable de entorno PORT
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+
+    # --- Ejecución Concurrente ---
+    print("Iniciando servidor web y bot de Telegram...")
+
+    # Inicia el bot (sin bloquear) y el servidor web
+    await asyncio.gather(application.run_polling(), site.start())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot detenido.")
