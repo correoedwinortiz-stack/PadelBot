@@ -1,37 +1,633 @@
+import os
+from dotenv import load_dotenv
+import httpx
+import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
+from datetime import datetime, timedelta
 
 
-from aiohttp import web  # Usamos aiohttp en lugar de Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+# --- CONFIGURACIÓN ---
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PADEL_API_KEY = os.getenv("PADEL_API_KEY")
 
-# --- CONFIGURACIÓN (sin cambios ) ---
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-PADEL_API_URL = "https://fantasy-padel-tour-api.onrender.com/api"
+if not TELEGRAM_TOKEN or not PADEL_API_KEY:
+    raise ValueError(
+        "❌ Asegúrate de que TELEGRAM_TOKEN y PADEL_API_KEY estén en tu archivo .env"
+    )
+
+# --- ¡LA CORRECCIÓN DEFINITIVA! ---
+# Usamos la URL correcta del panel de control de la API
+PADEL_API_URL = "https://en.fantasypadeltour.com/api"
 
 
-# --- LÓGICA DE LA API DE PÁDEL (sin cambios ) ---
-async def get_padel_rankings(gender: str) -> str:
+# Variables de caché en memoria
+TOURNAMENTS_CACHE = None
+TOURNAMENTS_CACHE_TIME = None
+CACHE_DURATION = timedelta(minutes=60)  # ⏳ refrescar cada 60 minutos
+
+# --- Caché de partidos en vivo ---
+LIVE_MATCHES_CACHE = {}
+CACHE_DURATION_MATCHES = timedelta(minutes=2)  # ⏳ refresco cada 2 minutos
+
+# --- Caché de últimos resultados ---
+LAST_RESULTS_CACHE = None
+LAST_RESULTS_CACHE_TIME = None
+CACHE_DURATION_RESULTS = timedelta(minutes=10)  # ⏳ refrescar cada 10 minutos
+
+
+# --- ALERTAS: DB FAVORITOS ---
+DB_PATH = "alertas.db"
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Favoritos
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER,
+            player_id INTEGER,
+            player_name TEXT,
+            PRIMARY KEY(user_id, player_id)
+        )
+    """
+    )
+    # Alertas ya enviadas
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notified (
+            user_id INTEGER,
+            match_id INTEGER,
+            status TEXT,
+            PRIMARY KEY(user_id, match_id, status)
+        )
+    """
+    )
+    conn.commit()
+    conn.close()
+
+
+def cleanup_notified():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Borrar notificaciones con más de 30 días
+    cur.execute(
+        """
+        DELETE FROM notified
+        WHERE rowid IN (
+            SELECT rowid FROM notified
+            WHERE date < date('now','-30 day')
+        )
+        """
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    if deleted > 0:
+        print(f"🧹 Limpieza: eliminadas {deleted} notificaciones antiguas.")
+
+
+async def fetch_live_matches_cached(tournament_id: int) -> list:
+    """
+    Devuelve los partidos de un torneo en vivo, usando caché para evitar
+    llamar muchas veces a la API.
+    """
+    now = datetime.now()
+
+    # Si ya tenemos en caché y sigue siendo válido → usarlo
+    if tournament_id in LIVE_MATCHES_CACHE:
+        cached_data, cached_time = LIVE_MATCHES_CACHE[tournament_id]
+        if (now - cached_time) < CACHE_DURATION_MATCHES:
+            print(f"✅ Usando partidos en vivo de torneo {tournament_id} desde caché.")
+            return cached_data
+
+    # Si no hay caché o está vencido → refrescar desde la API
+    print(f"🔄 Refrescando partidos en vivo del torneo {tournament_id} desde la API...")
+    headers = {"Authorization": f"Bearer {PADEL_API_KEY}", "Accept": "application/json"}
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(f"{PADEL_API_URL}/players/{gender}")
+            resp = await client.get(
+                f"{PADEL_API_URL}/tournaments/{tournament_id}/matches",
+                headers=headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        matches = data.get("data", [])
+        LIVE_MATCHES_CACHE[tournament_id] = (matches, now)
+        return matches
+
+    except Exception as e:
+        print(f"⚠️ Error en fetch_live_matches_cached: {e}")
+        return []
+
+
+async def fetch_all_tournaments_cached():
+    """
+    Devuelve la lista de torneos, usando caché para no saturar la API.
+    Se refresca cada CACHE_DURATION minutos.
+    """
+    global TOURNAMENTS_CACHE, TOURNAMENTS_CACHE_TIME
+
+    now = datetime.now()
+    if (
+        TOURNAMENTS_CACHE is None
+        or not TOURNAMENTS_CACHE_TIME
+        or (now - TOURNAMENTS_CACHE_TIME) > CACHE_DURATION
+    ):
+        print("🔄 Refrescando torneos desde la API (no en caché)...")
+        try:
+            TOURNAMENTS_CACHE = await fetch_all_tournaments()
+            TOURNAMENTS_CACHE_TIME = now
+        except Exception as e:
+            print(f"⚠️ Error al actualizar torneos: {e}")
+            # Si hay error pero tenemos caché previo → devolverlo
+            if TOURNAMENTS_CACHE is not None:
+                return TOURNAMENTS_CACHE
+            else:
+                return []
+    else:
+        print("✅ Usando torneos desde caché.")
+
+    return TOURNAMENTS_CACHE
+
+
+def was_notified(user_id: int, match_id: int, status: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM notified WHERE user_id = ? AND match_id = ? AND status = ?",
+        (user_id, match_id, status),
+    )
+    result = cur.fetchone()
+    conn.close()
+    return result is not None
+
+
+def mark_notified(user_id: int, match_id: int, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO notified (user_id, match_id, status) VALUES (?, ?, ?)",
+        (user_id, match_id, status),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_favorites(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT player_id, player_name FROM favorites WHERE user_id = ?", (user_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def remove_favorite(user_id: int, player_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM favorites WHERE user_id = ? AND player_id = ?",
+        (user_id, player_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- FUNCION SEGUIR (reutilizada en flujo con botones) ---
+async def seguir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        player_name = update.message.text
+    else:
+        return
+
+    headers = {"Authorization": f"Bearer {PADEL_API_KEY}", "Accept": "application/json"}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{PADEL_API_URL}/players", headers=headers, params={"name": player_name}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    players = data.get("data", [])
+    if not players:
+        await update.message.reply_text(f"❌ No encontré al jugador '{player_name}'.")
+        return
+
+    player = players[0]
+    player_id, real_name = player["id"], player["name"]
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO favorites (user_id, player_id, player_name) VALUES (?, ?, ?)",
+            (update.effective_user.id, player_id, real_name),
+        )
+        conn.commit()
+        await update.message.reply_text(
+            f"✅ Ahora sigues a {real_name}. ¡Te avisaré cuando juegue!"
+        )
+    except sqlite3.IntegrityError:
+        await update.message.reply_text(f"⚠️ Ya sigues a {real_name}.")
+    finally:
+        conn.close()
+
+
+# --- CAPTURA NOMBRE DEL JUGADOR ---
+async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_player") == "add":
+        context.user_data.pop("awaiting_player")
+        await seguir(update, context)
+
+
+async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT user_id, player_id, player_name FROM favorites")
+    favorites = cur.fetchall()
+    conn.close()
+
+    if not favorites:
+        return
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {PADEL_API_KEY}",
+            "Accept": "application/json",
+        }
+        tournaments = await fetch_all_tournaments_cached() or []
+        live_or_finished = [
+            t for t in tournaments if t["status"] in ("live", "finished")
+        ]
+
+        async with httpx.AsyncClient() as client:
+            for t in live_or_finished:
+                r = await client.get(
+                    f"{PADEL_API_URL}/tournaments/{t['id']}/matches", headers=headers
+                )
+                r.raise_for_status()
+                matches = r.json().get("data", [])
+
+                for m in matches:
+                    status = m.get("status")
+                    if status not in ("live", "finished"):
+                        continue
+
+                    # ⏳ Filtrar solo partidos recientes
+                    played_at = m.get("played_at")
+                    if status == "finished" and played_at:
+                        try:
+                            dt = datetime.strptime(played_at, "%Y-%m-%d").date()
+                            if (datetime.now().date() - dt).days > 1:
+                                continue  # demasiado viejo
+                        except Exception:
+                            continue
+
+                    players = m.get("players", {})
+                    team1 = " / ".join(p["name"] for p in players.get("team_1", []))
+                    team2 = " / ".join(p["name"] for p in players.get("team_2", []))
+                    all_players = [p["name"] for team in players.values() for p in team]
+
+                    score = format_match_score(m)
+                    duration = m.get("duration", "")
+                    round_map = {1: "Final", 2: "Semifinal", 4: "Cuartos", 8: "Octavos"}
+                    round_name = round_map.get(
+                        m.get("round", 0), f"Ronda {m.get('round', '?')}"
+                    )
+                    winner = m.get("winner")
+                    if winner == "team_1":
+                        team1 = f"🏆 {team1}"
+                    elif winner == "team_2":
+                        team2 = f"🏆 {team2}"
+
+                    # 📌 Revisar si ya notificamos este partido
+                    conn = sqlite3.connect(DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT 1 FROM notified WHERE match_id=? AND status=?",
+                        (m["id"], status),
+                    )
+                    already_notified = cur.fetchone()
+                    if already_notified:
+                        conn.close()
+                        continue
+
+                    # Guardar como notificado
+                    cur.execute(
+                        "INSERT INTO notified (match_id, status) VALUES (?, ?)",
+                        (m["id"], status),
+                    )
+                    conn.commit()
+                    conn.close()
+
+                    # 🔔 Enviar notificación solo a fans del jugador
+                    for user_id, pid, pname in favorites:
+                        if pname in all_players:
+                            text_status = (
+                                "está jugando ahora"
+                                if status == "live"
+                                else "terminó su partido"
+                            )
+                            message = (
+                                f"🔔 {pname} {text_status} en {t['name']} 🏆\n\n"
+                                f"👥 {team1} vs {team2}\n"
+                                f"📊 {score}\n"
+                                f"📅 {played_at or 'Hoy'}   ⏱️ {duration}\n"
+                                f"🔎 {round_name}"
+                            )
+                            await context.bot.send_message(
+                                chat_id=user_id, text=message
+                            )
+
+    except Exception as e:
+        print(f"Error en check_alerts: {e}")
+
+
+def format_match_score(match: dict) -> str:
+    """
+    Devuelve el marcador de un partido en formato legible.
+    Ejemplo: "6-1 | 6-4"
+    """
+    score_list = match.get("score") or []
+    if not score_list:
+        return "📊 Sin resultado"
+
+    return " | ".join(
+        f"{s.get('team_1', '?')}-{s.get('team_2', '?')}" for s in score_list
+    )
+
+
+async def fetch_all_tournaments() -> list:
+    """
+    Descarga todos los torneos de la API, recorriendo todas las páginas.
+    Siempre devuelve una lista (aunque esté vacía).
+    """
+    headers = {
+        "Authorization": f"Bearer {PADEL_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    tournaments = []
+    url = f"{PADEL_API_URL}/tournaments"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while url:
+            try:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                data = resp.json() or {}
+            except Exception as e:
+                print(f"⚠️ Error al pedir torneos: {e}")
+                break
+
+            tournaments.extend(data.get("data", []) or [])
+            url = data.get("links", {}).get("next")
+
+    return tournaments
+
+
+async def get_padel_rankings(gender: str) -> str:
+    """
+    Obtiene el Top 10 de jugadores/as desde la API oficial de Fantasy Padel Tour.
+
+    gender: "male" o "female" (Telegram usa estos en callback_data, los convertimos a men/women)
+    """
+    # Convertimos de "male"/"female" a "men"/"women"
+    if gender == "male":
+        api_gender = "men"
+    elif gender == "female":
+        api_gender = "women"
+    else:
+        return "⚠️ El género debe ser 'male' o 'female'."
+
+    print(f"Pidiendo rankings para {api_gender} en la API oficial...")
+
+    headers = {
+        "Authorization": f"Bearer {PADEL_API_KEY}",
+        "Accept": "application/json",
+    }
+    params = {"category": api_gender, "sort_by": "ranking", "order_by": "asc"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                "https://en.fantasypadeltour.com/api/players",
+                headers=headers,
+                params=params,
+            )
             response.raise_for_status()
-            players = response.json()
+            data = response.json()
+
+        players = data.get("data", [])
+        if not players:
+            return f"No se encontraron jugadores en la categoría '{api_gender}'."
+
+        # Tomamos solo el Top 10
         top_10_players = players[:10]
-        gender_title = "Masculino" if gender == "male" else "Femenino"
+
+        gender_title = "Masculino" if api_gender == "men" else "Femenino"
         message = f"🏆 **Ranking {gender_title} - Top 10** 🏆\n\n"
         for player in top_10_players:
             rank = player.get("ranking", "N/A")
             name = player.get("name", "Sin Nombre")
             points = player.get("points", 0)
-            message += f"**{rank}.** {name} - `{points}` pts\n"
+            nationality = player.get("nationality", "??")
+            message += f"**{rank}.** {name} ({nationality}) - `{points}` pts\n"
+
+        print(f"Ranking {api_gender} formateado con éxito.")
         return message
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return "❌ Error de autenticación. Verifica tu API Key."
+        return f"⚠️ Error HTTP {e.response.status_code}: {e}"
+    except httpx.RequestError as e:
+        return f"⚠️ Error de conexión con la API: {e}"
     except Exception as e:
-        print(f"Error al obtener rankings: {e}")
-        return "Lo siento, ocurrió un error al obtener los rankings."
+        return f"⚠️ Error inesperado: {e}"
 
 
-# --- LÓGICA DEL BOT DE TELEGRAM (sin cambios) ---
+async def get_padel_calendar() -> str:
+    print("📅 Pidiendo calendario de torneos (usando caché)...")
+
+    try:
+        tournaments = await fetch_all_tournaments_cached() or []
+        upcoming = [t for t in tournaments if t.get("status") == "upcoming"]
+
+        if not upcoming:
+            return "📅 No hay torneos próximos publicados en este momento."
+
+        top_5 = upcoming[:5]
+        message = "📅 **Próximos Torneos de Pádel** 📅\n\n"
+
+        for i, t in enumerate(top_5, start=1):
+            name = t.get("name", "Sin nombre")
+            location = t.get("location", "Lugar desconocido")
+            country = t.get("country", "")
+            start_date = t.get("start_date", "¿?")
+            end_date = t.get("end_date", "¿?")
+            message += (
+                f"**{i}. {name}**\n"
+                f"   📍 {location}, {country}\n"
+                f"   📅 {start_date} → {end_date}\n\n"
+            )
+
+        return message
+
+    except Exception as e:
+        print(f"⚠️ Error en get_padel_calendar: {e}")
+        return "⚠️ No se pudo obtener el calendario en este momento."
+
+
+# --- FUNCIÓN: TORNEOS EN VIVO ---
+async def get_live_tournaments() -> list:
+    """
+    Devuelve todos los torneos que están en estado 'live'.
+    """
+    tournaments = await fetch_all_tournaments()
+    live_tournaments = [t for t in tournaments if t.get("status") == "live"]
+    return live_tournaments
+
+
+# --- FUNCIÓN: PARTIDOS EN VIVO DE UN TORNEO ---
+async def get_live_matches(tournament_id: int) -> str:
+    matches = await fetch_live_matches_cached(int(tournament_id))
+
+    # Filtrar solo partidos en vivo
+    live_matches = [m for m in matches if m.get("status") == "live"]
+
+    if not live_matches:
+        return "⚠️ No hay partidos en curso en este torneo."
+
+    message = f"🎾 **Partidos en Vivo - Torneo {tournament_id}** 🎾\n\n"
+    for m in live_matches[:10]:  # mostramos solo los primeros 10
+        players_t1 = " / ".join(
+            p.get("name", "?") for p in m.get("players", {}).get("team_1", [])
+        )
+        players_t2 = " / ".join(
+            p.get("name", "?") for p in m.get("players", {}).get("team_2", [])
+        )
+
+        score = format_match_score(m)
+        message += f"👥 {players_t1} vs {players_t2}\n📊 {score}\n⏱️ En juego\n\n"
+
+    return message
+
+
+async def get_last_results(summary_only: bool = True) -> str:
+    """
+    Obtiene los últimos resultados de torneos finalizados,
+    mostrando rivales, marcador, fecha, duración y ronda.
+    """
+    global LAST_RESULTS_CACHE, LAST_RESULTS_CACHE_TIME
+
+    now = datetime.now()
+    if (
+        LAST_RESULTS_CACHE
+        and LAST_RESULTS_CACHE_TIME
+        and (now - LAST_RESULTS_CACHE_TIME) < CACHE_DURATION_RESULTS
+    ):
+        print("✅ Usando últimos resultados desde caché.")
+        return LAST_RESULTS_CACHE
+
+    headers = {
+        "Authorization": f"Bearer {PADEL_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    try:
+        tournaments = await fetch_all_tournaments_cached() or []
+        finished = [t for t in tournaments if t.get("status") == "finished"]
+
+        if not finished:
+            return "⚠️ No hay torneos finalizados en la API."
+
+        last_tournament = finished[-1]
+        t_id, t_name = last_tournament["id"], last_tournament["name"]
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{PADEL_API_URL}/tournaments/{t_id}/matches",
+                headers=headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            matches_data = resp.json()
+
+        matches = matches_data.get("data", []) or []
+        finished_matches = [m for m in matches if m.get("status") == "finished"]
+
+        if not finished_matches:
+            return f"📜 Últimos Resultados - {t_name}\n\n(No hay partidos finalizados todavía)"
+
+        # Ordenar por ronda (Final primero)
+        finished_matches.sort(key=lambda m: m.get("round", 99))
+
+        resultados = []
+        for m in finished_matches[:5]:  # máximo 5 partidos
+            players = m.get("players", {})
+            team1 = " / ".join(p.get("name", "?") for p in players.get("team_1", []))
+            team2 = " / ".join(p.get("name", "?") for p in players.get("team_2", []))
+
+            # marcador
+            score = format_match_score(m)
+
+            # fecha y duración
+            played_at = m.get("played_at", "¿?")
+            duration = m.get("duration", "")
+
+            # ronda
+            round_map = {1: "Final", 2: "Semifinal", 4: "Cuartos", 8: "Octavos"}
+            round_name = round_map.get(
+                m.get("round", 0), f"Ronda {m.get('round', '?')}"
+            )
+
+            # ganador
+            winner = m.get("winner")
+            if winner == "team_1":
+                team1 = f"🏆 {team1}"
+            elif winner == "team_2":
+                team2 = f"🏆 {team2}"
+
+            resultados.append(
+                f"👥 {team1} vs {team2}\n"
+                f"📊 {score}\n"
+                f"📅 {played_at}   ⏱️ {duration}\n"
+                f"🔎 {round_name}"
+            )
+
+        message = f"📜 **Últimos Resultados - {t_name}** 📜\n\n" + "\n\n".join(
+            resultados
+        )
+
+        # Guardar en caché
+        LAST_RESULTS_CACHE = message
+        LAST_RESULTS_CACHE_TIME = now
+
+        return message
+
+    except Exception as e:
+        print(f"Error en get_last_results: {e}")
+        return "⚠️ Error al obtener últimos resultados."
+
+
+# --- LÓGICA DEL BOT (sin cambios) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     welcome_message = (
@@ -48,6 +644,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             InlineKeyboardButton("📊 Rankings", callback_data="show_rankings"),
             InlineKeyboardButton("📅 Calendario", callback_data="calendar"),
         ],
+        [InlineKeyboardButton("📜 Últimos Resultados", callback_data="last_results")],
         [InlineKeyboardButton("❓ Ayuda", callback_data="help")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -61,13 +658,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# --- HANDLER DE BOTONES ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     parts = query.data.split("_")
     command = parts[0]
+
+    # --- MENÚ PRINCIPAL ---
     if command == "start":
         await start(update, context)
+
+    # --- SUBMENÚ ALERTAS ---
+    elif command == "my" and parts[1] == "alerts":
+        keyboard = [
+            [InlineKeyboardButton("➕ Seguir jugador", callback_data="alerts_add")],
+            [InlineKeyboardButton("📋 Ver seguidos", callback_data="alerts_list")],
+            [InlineKeyboardButton("« Volver", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🔔 Gestión de Alertas", reply_markup=reply_markup
+        )
+
+    elif command == "alerts":
+        if parts[1] == "add":
+            await query.edit_message_text(
+                "✍️ Escribe el nombre del jugador que quieres seguir:"
+            )
+            context.user_data["awaiting_player"] = "add"
+
+        elif parts[1] == "list":
+            favorites = get_favorites(query.from_user.id)
+            if not favorites:
+                await query.edit_message_text("📭 No estás siguiendo a ningún jugador.")
+                return
+
+            keyboard = []
+            for pid, pname in favorites:
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"❌ {pname}", callback_data=f"unfollow_{pid}"
+                        )
+                    ]
+                )
+            keyboard.append(
+                [InlineKeyboardButton("« Volver", callback_data="my_alerts")]
+            )
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            text = "📋 Jugadores que sigues:\n\n" + "\n".join(
+                [f"✅ {pname}" for _, pname in favorites]
+            )
+            await query.edit_message_text(text, reply_markup=reply_markup)
+
+    elif command == "unfollow":
+        player_id = parts[1]
+        remove_favorite(query.from_user.id, player_id)
+        await query.edit_message_text("❌ Jugador eliminado de tus alertas.")
+
+    # --- RANKINGS ---
     elif command == "show" and parts[1] == "rankings":
         keyboard = [
             [
@@ -80,66 +731,128 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(
             text="Selecciona el ranking que quieres ver:", reply_markup=reply_markup
         )
+
     elif command == "rankings":
         gender = parts[1]
         await query.edit_message_text(
             text="🔄 Obteniendo los datos del ranking, por favor espera..."
         )
         rankings_text = await get_padel_rankings(gender)
-        keyboard = [[InlineKeyboardButton("« Volver", callback_data="show_rankings")]]
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "« Volver a Rankings", callback_data="show_rankings"
+                )
+            ],
+            [InlineKeyboardButton("« Volver al Menú Principal", callback_data="start")],
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
             text=rankings_text, reply_markup=reply_markup, parse_mode="Markdown"
         )
+
+    # --- CALENDARIO ---
+    elif command == "calendar":
+        await query.edit_message_text(
+            text="🔄 Obteniendo calendario de torneos, por favor espera..."
+        )
+        calendar_text = await get_padel_calendar()
+        keyboard = [
+            [InlineKeyboardButton("« Volver al Menú Principal", callback_data="start")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=calendar_text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+
+    # --- PARTIDOS EN VIVO ---
+    elif command == "live":
+        live_tournaments = await get_live_tournaments()
+        if not live_tournaments:
+            await query.edit_message_text("🚫 No hay torneos en curso en este momento.")
+            return
+
+        keyboard = []
+        for t in live_tournaments:
+            keyboard.append(
+                [InlineKeyboardButton(t["name"], callback_data=f"matches_{t['id']}")]
+            )
+        keyboard.append(
+            [InlineKeyboardButton("« Volver al Menú", callback_data="start")]
+        )
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Selecciona un torneo en vivo:", reply_markup=reply_markup
+        )
+
+    elif command == "matches":
+        tournament_id = parts[1]
+        await query.edit_message_text("🔄 Obteniendo partidos en vivo...")
+        matches_text = await get_live_matches(tournament_id)
+        keyboard = [[InlineKeyboardButton("« Volver", callback_data="live_matches")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=matches_text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+
+    # --- RESULTADOS ---
+    elif command == "last":
+        await query.edit_message_text("📜 Obteniendo últimos resultados...")
+        results_text = await get_last_results(summary_only=True)
+        keyboard = [
+            [InlineKeyboardButton("📜 Ver todos", callback_data="all_results")],
+            [InlineKeyboardButton("« Volver al Menú", callback_data="start")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=results_text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+
+    elif command == "all":
+        await query.edit_message_text("📜 Obteniendo todos los resultados...")
+        results_text = await get_last_results(summary_only=False)
+        keyboard = [[InlineKeyboardButton("« Volver al Menú", callback_data="start")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            text=results_text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+
+    # --- DEFAULT ---
     else:
         keyboard = [[InlineKeyboardButton("« Volver al Menú", callback_data="start")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            text=f"La función '{query.data}' se implementará pronto.",
+            text=f"La función '{query.data}' se implementará pronto. ¡Gracias por tu paciencia! 😊",
             reply_markup=reply_markup,
         )
 
 
-# --- NUEVA ESTRUCTURA PRINCIPAL ASÍNCRONA ---
-
-
-async def main():
-    """Configura e inicia el bot y el servidor web de forma concurrente."""
-
-    # --- Configuración del Bot de Telegram ---
-    if not TELEGRAM_TOKEN:
-        print("Error: No se encontró el TELEGRAM_TOKEN.")
-        return
+# --- MAIN ---
+def main() -> None:
+    print("Iniciando bot con alertas...")
+    init_db()
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_name)
+    )
 
-    # --- Configuración del Servidor Web aiohttp ---
-    app = web.Application()
+    # Limpieza automática cada 24 horas
+    application.job_queue.run_repeating(
+        lambda ctx: cleanup_notified(), interval=86400, first=60
+    )
 
-    # Ruta principal que Render verificará
-    async def health_check(request):
-        return web.Response(text="El bot está activo y escuchando.")
+    # Job de alertas cada 5 min
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_alerts, interval=1800, first=10)
 
-    app.router.add_get("/", health_check)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    # Render nos da el puerto a través de la variable de entorno PORT
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-
-    # --- Ejecución Concurrente ---
-    print("Iniciando servidor web y bot de Telegram...")
-
-    # Inicia el bot (sin bloquear) y el servidor web
-    await asyncio.gather(application.run_polling(), site.start())
+    print("El bot está en línea. Presiona Ctrl+C para detenerlo.")
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Bot detenido.")
+    main()
