@@ -712,7 +712,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             context.user_data["awaiting_player"] = "add"
 
         elif parts[1] == "list":
-            favorites = get_favorites(query.from_user.id)
+            favorites = await get_favorites(query.from_user.id)
             if not favorites:
                 await query.edit_message_text("📭 No estás siguiendo a ningún jugador.")
                 return
