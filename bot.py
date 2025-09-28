@@ -810,7 +810,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def main():
+def main():
     print("Iniciando bot con alertas...")
 
     # Crear aplicación
