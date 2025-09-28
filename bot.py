@@ -45,7 +45,8 @@ CACHE_DURATION_RESULTS = timedelta(minutes=10)  # ⏳ refrescar cada 10 minutos
 
 
 # --- ALERTAS: DB FAVORITOS ---
-DB_PATH = "alertas.db"
+# --- DB_PATH = "alertas.db" --- uso en local
+DB_PATH = os.getenv("DB_PATH", "alertas.db")
 
 
 def init_db():
