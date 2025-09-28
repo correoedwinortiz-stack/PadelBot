@@ -706,11 +706,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif command == "alerts":
         if parts[1] == "add":
+            # Menú con 2 opciones
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "🏆 Top 10 Masculino", callback_data="choose_male"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🏆 Top 10 Femenino", callback_data="choose_female"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✍️ Ingresar nombre manualmente", callback_data="manual_add"
+                    )
+                ],
+                [InlineKeyboardButton("« Volver", callback_data="my_alerts")],
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
-                "✍️ Escribe el nombre del jugador que quieres seguir:"
+                "🔎 ¿Cómo quieres elegir al jugador?",
+                reply_markup=reply_markup,
             )
-            context.user_data["awaiting_player"] = "add"
-
         elif parts[1] == "list":
             favorites = await get_favorites(query.from_user.id)
             if not favorites:
@@ -735,6 +754,72 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 [f"✅ {pname}" for _, pname in favorites]
             )
             await query.edit_message_text(text, reply_markup=reply_markup)
+
+    elif command == "choose":
+        gender = parts[1]  # male o female
+        headers = {
+            "Authorization": f"Bearer {PADEL_API_KEY}",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{PADEL_API_URL}/players",
+                headers=headers,
+                params={
+                    "category": "men" if gender == "male" else "women",
+                    "sort_by": "ranking",
+                    "order_by": "asc",
+                },
+            )
+            players = resp.json().get("data", [])[:10]
+
+        keyboard = []
+        for p in players:
+            keyboard.append(
+                [InlineKeyboardButton(p["name"], callback_data=f"follow_{p['id']}")]
+            )
+        keyboard.append([InlineKeyboardButton("« Volver", callback_data="alerts_add")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"Elige un jugador del Top 10 {'Masculino' if gender=='male' else 'Femenino'}:",
+            reply_markup=reply_markup,
+        )
+
+    elif command == "follow":
+        player_id = int(parts[1])
+        headers = {
+            "Authorization": f"Bearer {PADEL_API_KEY}",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{PADEL_API_URL}/players/{player_id}", headers=headers
+            )
+            player = resp.json()
+
+        player_name = player.get("name", "Desconocido")
+        conn = await asyncpg.connect(DATABASE_URL)
+        try:
+            await conn.execute(
+                "INSERT INTO favorites (user_id, player_id, player_name) VALUES ($1, $2, $3)",
+                query.from_user.id,
+                player_id,
+                player_name,
+            )
+            await query.edit_message_text(f"✅ Ahora sigues a {player_name}.")
+        except asyncpg.UniqueViolationError:
+            await query.edit_message_text(f"⚠️ Ya sigues a {player_name}.")
+        finally:
+            await conn.close()
+
+    # --- OPCIÓN MANUAL (como ya lo tenías) ---
+    elif command == "manual":
+        if parts[1] == "add":
+            await query.edit_message_text(
+                "✍️ Escribe el nombre del jugador que quieres seguir:"
+            )
+            context.user_data["awaiting_player"] = "add"
 
     elif command == "unfollow":
         player_id = parts[1]
