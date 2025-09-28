@@ -73,6 +73,16 @@ async def init_db():
         )
     """
     )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            user_id INTEGER PRIMARY KEY,
+            status TEXT DEFAULT 'active',
+            plan TEXT DEFAULT 'premium',
+            subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     await conn.close()
 
 
@@ -189,6 +199,29 @@ async def get_favorites(user_id: int):
     )
     await conn.close()
     return [(r["player_id"], r["player_name"]) for r in rows]
+
+
+async def is_subscriber(user_id: int) -> bool:
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow(
+        "SELECT status FROM subscribers WHERE user_id=$1", str(user_id)
+    )
+    await conn.close()
+    return row and row["status"] == "active"
+
+
+async def add_subscriber(user_id: int, plan="premium"):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        """
+        INSERT INTO subscribers (user_id, status, plan)
+        VALUES ($1, 'active', $2)
+        ON CONFLICT (user_id) DO UPDATE SET status='active', plan=$2
+    """,
+        str(user_id),
+        plan,
+    )
+    await conn.close()
 
 
 async def remove_favorite(user_id: int, player_id: int):
@@ -585,28 +618,60 @@ async def get_padel_rankings(gender: str) -> str:
 
 
 async def get_padel_calendar() -> str:
+    """
+    Obtiene torneos próximos desde la API (usa la caché central).
+    Incluye torneos cuyo estado sea upcoming/scheduled/created o
+    aquellos con start_date >= hoy aunque el estado no esté correcto.
+    """
     print("📅 Pidiendo calendario de torneos (usando caché)...")
 
     try:
         tournaments = await fetch_all_tournaments_cached() or []
-        upcoming = [t for t in tournaments if t.get("status") == "upcoming"]
+        # DEBUG: ver los primeros resultados (quita o comenta cuando no lo necesites)
+        print(
+            f"🔍 DEBUG: recibidos {len(tournaments)} torneos (ejemplos): {tournaments[:5]}"
+        )
+
+        today = datetime.now().date()
+
+        upcoming = []
+        for t in tournaments:
+            status = (t.get("status") or "").lower()
+            start_raw = t.get("start_date")
+            start_date = None
+            if start_raw:
+                # la API usa 'YYYY-MM-DD' normalmente; intentamos parsear
+                try:
+                    start_date = datetime.strptime(start_raw, "%Y-%m-%d").date()
+                except Exception:
+                    # no pudimos parsear -> lo ignoramos como fecha válida
+                    start_date = None
+
+            # incluir si estado indica próximo o si la fecha de inicio es hoy o futura
+            if status in ("upcoming", "scheduled", "created") or (
+                start_date and start_date >= today
+            ):
+                upcoming.append(t)
 
         if not upcoming:
             return "📅 No hay torneos próximos publicados en este momento."
 
-        top_5 = upcoming[:5]
-        message = "📅 **Próximos Torneos de Pádel** 📅\n\n"
+        # ordenar por fecha de inicio (si no tiene fecha, lo mandamos al final)
+        upcoming_sorted = sorted(
+            upcoming, key=lambda x: x.get("start_date") or "9999-12-31"
+        )
 
-        for i, t in enumerate(top_5, start=1):
+        message = "📅 **Próximos Torneos de Pádel** 📅\n\n"
+        for i, t in enumerate(upcoming_sorted[:10], start=1):
             name = t.get("name", "Sin nombre")
-            location = t.get("location", "Lugar desconocido")
+            location = t.get("location") or t.get("venue") or "Lugar desconocido"
             country = t.get("country", "")
-            start_date = t.get("start_date", "¿?")
-            end_date = t.get("end_date", "¿?")
+            start = t.get("start_date", "¿?")
+            end = t.get("end_date", "¿?")
             message += (
                 f"**{i}. {name}**\n"
                 f"   📍 {location}, {country}\n"
-                f"   📅 {start_date} → {end_date}\n\n"
+                f"   📅 {start} → {end}\n\n"
             )
 
         return message
