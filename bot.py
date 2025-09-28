@@ -12,6 +12,8 @@ from telegram.ext import (
     filters,
 )
 from datetime import datetime, timedelta
+import asyncpg
+import asyncio
 
 
 # --- CONFIGURACIÓN ---
@@ -46,56 +48,45 @@ CACHE_DURATION_RESULTS = timedelta(minutes=10)  # ⏳ refrescar cada 10 minutos
 
 # --- ALERTAS: DB FAVORITOS ---
 # --- DB_PATH = "alertas.db" --- uso en local
-DB_PATH = os.getenv("DB_PATH", "alertas.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # Favoritos
-    cur.execute(
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    # Crear tablas si no existen
+    await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS favorites (
-            user_id INTEGER,
-            player_id INTEGER,
+            user_id BIGINT,
+            player_id BIGINT,
             player_name TEXT,
             PRIMARY KEY(user_id, player_id)
         )
     """
     )
-    # Alertas ya enviadas
-    cur.execute(
+    await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS notified (
-            user_id INTEGER,
-            match_id INTEGER,
+            user_id BIGINT,
+            match_id BIGINT,
             status TEXT,
             PRIMARY KEY(user_id, match_id, status)
         )
     """
     )
-    conn.commit()
-    conn.close()
+    await conn.close()
 
 
-def cleanup_notified():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    # Borrar notificaciones con más de 30 días
-    cur.execute(
+async def cleanup_notified():
+    conn = await asyncpg.connect(DATABASE_URL)
+    deleted = await conn.execute(
         """
         DELETE FROM notified
-        WHERE rowid IN (
-            SELECT rowid FROM notified
-            WHERE date < date('now','-30 day')
-        )
-        """
+        WHERE created_at < NOW() - INTERVAL '30 days'
+    """
     )
-    deleted = cur.rowcount
-    conn.commit()
-    conn.close()
-    if deleted > 0:
-        print(f"🧹 Limpieza: eliminadas {deleted} notificaciones antiguas.")
+    await conn.close()
+    print(f"🧹 Limpieza ejecutada: {deleted}")
 
 
 async def fetch_live_matches_cached(tournament_id: int) -> list:
@@ -165,49 +156,48 @@ async def fetch_all_tournaments_cached():
     return TOURNAMENTS_CACHE
 
 
-def was_notified(user_id: int, match_id: int, status: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM notified WHERE user_id = ? AND match_id = ? AND status = ?",
-        (user_id, match_id, status),
+async def was_notified(user_id: int, match_id: int, status: str) -> bool:
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow(
+        "SELECT 1 FROM notified WHERE user_id=$1 AND match_id=$2 AND status=$3",
+        user_id,
+        match_id,
+        status,
     )
-    result = cur.fetchone()
-    conn.close()
-    return result is not None
+    await conn.close()
+    return row is not None
 
 
-def mark_notified(user_id: int, match_id: int, status: str):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO notified (user_id, match_id, status) VALUES (?, ?, ?)",
-        (user_id, match_id, status),
+async def mark_notified(user_id: int, match_id: int, status: str):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        """
+        INSERT INTO notified (user_id, match_id, status)
+        VALUES ($1, $2, $3)
+        ON CONFLICT DO NOTHING
+        """,
+        user_id,
+        match_id,
+        status,
     )
-    conn.commit()
-    conn.close()
+    await conn.close()
 
 
-def get_favorites(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT player_id, player_name FROM favorites WHERE user_id = ?", (user_id,)
+async def get_favorites(user_id: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch(
+        "SELECT player_id, player_name FROM favorites WHERE user_id=$1", user_id
     )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    await conn.close()
+    return [(r["player_id"], r["player_name"]) for r in rows]
 
 
-def remove_favorite(user_id: int, player_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM favorites WHERE user_id = ? AND player_id = ?",
-        (user_id, player_id),
+async def remove_favorite(user_id: int, player_id: int):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "DELETE FROM favorites WHERE user_id=$1 AND player_id=$2", user_id, player_id
     )
-    conn.commit()
-    conn.close()
+    await conn.close()
 
 
 # --- FUNCION SEGUIR (reutilizada en flujo con botones) ---
@@ -233,21 +223,21 @@ async def seguir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = players[0]
     player_id, real_name = player["id"], player["name"]
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+    conn = await asyncpg.connect(DATABASE_URL)
     try:
-        cur.execute(
-            "INSERT INTO favorites (user_id, player_id, player_name) VALUES (?, ?, ?)",
-            (update.effective_user.id, player_id, real_name),
+        await conn.execute(
+            "INSERT INTO favorites (user_id, player_id, player_name) VALUES ($1, $2, $3)",
+            update.effective_user.id,
+            player_id,
+            real_name,
         )
-        conn.commit()
         await update.message.reply_text(
             f"✅ Ahora sigues a {real_name}. ¡Te avisaré cuando juegue!"
         )
-    except sqlite3.IntegrityError:
+    except asyncpg.UniqueViolationError:
         await update.message.reply_text(f"⚠️ Ya sigues a {real_name}.")
     finally:
-        conn.close()
+        await conn.close()
 
 
 # --- CAPTURA NOMBRE DEL JUGADOR ---
@@ -258,11 +248,11 @@ async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT DISTINCT user_id, player_id, player_name FROM favorites")
-    favorites = cur.fetchall()
-    conn.close()
+    conn = await asyncpg.connect(DATABASE_URL)
+    favorites = await conn.fetch(
+        "SELECT DISTINCT user_id, player_id, player_name FROM favorites"
+    )
+    await conn.close()
 
     if not favorites:
         return
@@ -296,7 +286,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                         try:
                             dt = datetime.strptime(played_at, "%Y-%m-%d").date()
                             if (datetime.now().date() - dt).days > 1:
-                                continue  # demasiado viejo
+                                continue
                         except Exception:
                             continue
 
@@ -317,29 +307,20 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                     elif winner == "team_2":
                         team2 = f"🏆 {team2}"
 
-                    # 📌 Revisar si ya notificamos este partido
-                    conn = sqlite3.connect(DB_PATH)
-                    cur = conn.cursor()
-                    cur.execute(
-                        "SELECT 1 FROM notified WHERE match_id=? AND status=?",
-                        (m["id"], status),
-                    )
-                    already_notified = cur.fetchone()
-                    if already_notified:
-                        conn.close()
-                        continue
-
-                    # Guardar como notificado
-                    cur.execute(
-                        "INSERT INTO notified (match_id, status) VALUES (?, ?)",
-                        (m["id"], status),
-                    )
-                    conn.commit()
-                    conn.close()
-
-                    # 🔔 Enviar notificación solo a fans del jugador
-                    for user_id, pid, pname in favorites:
+                    # 🔔 Notificar a cada usuario que tenga este jugador
+                    for fav in favorites:
+                        user_id, pid, pname = (
+                            fav["user_id"],
+                            fav["player_id"],
+                            fav["player_name"],
+                        )
                         if pname in all_players:
+                            already_notified = await was_notified(
+                                user_id, m["id"], status
+                            )
+                            if already_notified:
+                                continue
+
                             text_status = (
                                 "está jugando ahora"
                                 if status == "live"
@@ -355,6 +336,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
                             await context.bot.send_message(
                                 chat_id=user_id, text=message
                             )
+                            await mark_notified(user_id, m["id"], status)
 
     except Exception as e:
         print(f"Error en check_alerts: {e}")
@@ -832,7 +814,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- MAIN ---
 def main() -> None:
     print("Iniciando bot con alertas...")
-    init_db()
+    asyncio.run(init_db())
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
