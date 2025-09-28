@@ -241,9 +241,148 @@ async def seguir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- CAPTURA NOMBRE DEL JUGADOR ---
 async def capture_player_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_player") == "add":
-        context.user_data.pop("awaiting_player")
-        await seguir(update, context)
+    """
+    Handler cuando el usuario escribe el nombre del jugador (ruta 'manual_add').
+    - Busca jugadores por nombre en la API.
+    - Si hay 0 resultados -> sugiere reintentar o usar el Top10.
+    - Si hay 1 resultado -> guarda en favorites (si no estaba ya).
+    - Si hay varios -> muestra botones para confirmar (usa callback_data 'follow_<id>').
+    """
+    # Solo procesamos si estábamos esperando el nombre
+    if context.user_data.get("awaiting_player") != "add":
+        return
+
+    # Consumimos la señal de "esperando nombre"
+    context.user_data.pop("awaiting_player", None)
+
+    player_query = (update.message.text or "").strip()
+    if not player_query:
+        await update.message.reply_text(
+            "❌ No recibí ningún nombre. Escribe el nombre del jugador que quieres seguir."
+        )
+        return
+
+    headers = {"Authorization": f"Bearer {PADEL_API_KEY}", "Accept": "application/json"}
+
+    # Intento principal: buscar por el texto completo
+    players = []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{PADEL_API_URL}/players",
+                headers=headers,
+                params={"name": player_query},
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+            players = data.get("data", []) or []
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            await update.message.reply_text(
+                "⚠️ La API está rate-limited en este momento. Intenta de nuevo en unos minutos."
+            )
+            return
+        await update.message.reply_text(
+            "⚠️ Error al consultar la API de jugadores. Intenta de nuevo más tarde."
+        )
+        return
+    except Exception as e:
+        await update.message.reply_text(
+            "⚠️ No pude contactar la API de jugadores. Intenta de nuevo más tarde."
+        )
+        return
+
+    # Si no encontró nada, intentamos buscar por fragmentos (primer/última palabra)
+    if not players:
+        parts = player_query.split()
+        tried = set()
+        for frag in parts[:1] + parts[-1:]:
+            frag = frag.strip()
+            if not frag or frag in tried:
+                continue
+            tried.add(frag)
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.get(
+                        f"{PADEL_API_URL}/players",
+                        headers=headers,
+                        params={"name": frag},
+                    )
+                    r.raise_for_status()
+                    data = r.json() or {}
+                    found = data.get("data", []) or []
+                    # añadir nuevos (evitar duplicados por id)
+                    for p in found:
+                        if p not in players:
+                            players.append(p)
+                if players:
+                    break
+            except Exception:
+                continue
+
+    # Si sigue sin resultados
+    if not players:
+        await update.message.reply_text(
+            "❌ No encontré jugadores con ese nombre.\n\n"
+            "✔️ Opciones:\n"
+            " • Reintenta con otra ortografía.\n"
+            " • Elige desde el Top10: Menú → 🔔 Mis Alertas → ➕ Seguir jugador → Top10."
+        )
+        return
+
+    # Si hay exactamente 1 candidato → guardarlo (si no ya existe)
+    if len(players) == 1:
+        p = players[0]
+        player_id = p.get("id")
+        player_name_real = p.get("name", "Desconocido")
+
+        # Guardar en la DB (comprobamos si ya lo seguía)
+        try:
+            conn = await asyncpg.connect(DATABASE_URL)
+            existed = await conn.fetchval(
+                "SELECT 1 FROM favorites WHERE user_id=$1 AND player_id=$2",
+                update.effective_user.id,
+                player_id,
+            )
+            if existed:
+                await update.message.reply_text(f"⚠️ Ya sigues a {player_name_real}.")
+            else:
+                await conn.execute(
+                    "INSERT INTO favorites (user_id, player_id, player_name) VALUES ($1, $2, $3)",
+                    update.effective_user.id,
+                    player_id,
+                    player_name_real,
+                )
+                await update.message.reply_text(
+                    f"✅ Ahora sigues a {player_name_real}. ¡Te avisaré cuando juegue!"
+                )
+            await conn.close()
+        except Exception as e:
+            # no exponemos stack trace al usuario
+            await update.message.reply_text(
+                "⚠️ Error al guardar en la base de datos. Intenta de nuevo más tarde."
+            )
+        return
+
+    # Si hay varios candidatos -> mostrar botón para confirmar (reutiliza 'follow_<id>' que ya manejas)
+    # Limitamos a un máximo razonable (ej. 8) para no saturar el teclado
+    max_choices = 8
+    keyboard = []
+    for p in players[:max_choices]:
+        pid = p.get("id")
+        pname = p.get("name", "Desconocido")
+        keyboard.append([InlineKeyboardButton(pname, callback_data=f"follow_{pid}")])
+
+    keyboard.append(
+        [InlineKeyboardButton("🔄 Buscar de nuevo", callback_data="alerts_add")]
+    )
+    keyboard.append([InlineKeyboardButton("« Volver", callback_data="my_alerts")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "He encontrado varios jugadores que podrían coincidir. Selecciona el correcto:",
+        reply_markup=reply_markup,
+    )
 
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
@@ -510,6 +649,8 @@ async def get_live_tournaments() -> list:
 # --- FUNCIÓN: PARTIDOS EN VIVO DE UN TORNEO ---
 async def get_live_matches(tournament_id: int) -> str:
     matches = await fetch_live_matches_cached(int(tournament_id))
+
+    print(f"🔍 DEBUG: Matches recibidos de API para torneo {tournament_id}: {matches}")
 
     # 🎾 Filtrar partidos en vivo
     live_matches = [m for m in matches if m.get("status") == "live"]
