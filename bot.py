@@ -653,7 +653,12 @@ async def get_live_matches(tournament_id: int) -> str:
     print(f"🔍 DEBUG: Matches recibidos de API para torneo {tournament_id}: {matches}")
 
     # 🎾 Filtrar partidos en vivo
-    live_matches = [m for m in matches if m.get("status") == "live"]
+    live_matches = [
+        m
+        for m in matches
+        if m.get("status") == "live"
+        or (m.get("connections", {}).get("live") and m.get("status") == "scheduled")
+    ]
 
     if live_matches:
         message = f"🎾 **Partidos en Vivo - Torneo {tournament_id}** 🎾\n\n"
