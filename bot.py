@@ -10,7 +10,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import asyncpg
 import asyncio
 
@@ -480,36 +480,77 @@ async def get_padel_calendar() -> str:
 # --- FUNCIÓN: TORNEOS EN VIVO ---
 async def get_live_tournaments() -> list:
     """
-    Devuelve todos los torneos que están en estado 'live'.
+    Devuelve los torneos en vivo o, si no hay, los programados para la fecha de hoy.
+    Si no hay ninguno, devuelve lista vacía.
     """
-    tournaments = await fetch_all_tournaments()
+    tournaments = await fetch_all_tournaments_cached()
+    today_str = date.today().isoformat()
+
+    # 1) Buscar torneos con partidos en vivo
     live_tournaments = [t for t in tournaments if t.get("status") == "live"]
-    return live_tournaments
+
+    if live_tournaments:
+        return live_tournaments
+
+    # 2) Si no hay, buscar torneos con partidos programados para hoy
+    today_tournaments = [
+        t
+        for t in tournaments
+        if t.get("status") == "scheduled"
+        and t.get("scheduled_at", "").startswith(today_str)
+    ]
+
+    if today_tournaments:
+        return today_tournaments
+
+    # 3) Si tampoco hay, devolvemos vacío
+    return []
 
 
 # --- FUNCIÓN: PARTIDOS EN VIVO DE UN TORNEO ---
 async def get_live_matches(tournament_id: int) -> str:
     matches = await fetch_live_matches_cached(int(tournament_id))
 
-    # Filtrar solo partidos en vivo
+    # 🎾 Filtrar partidos en vivo
     live_matches = [m for m in matches if m.get("status") == "live"]
 
-    if not live_matches:
-        return "⚠️ No hay partidos en curso en este torneo."
+    if live_matches:
+        message = f"🎾 **Partidos en Vivo - Torneo {tournament_id}** 🎾\n\n"
+        for m in live_matches[:10]:
+            players_t1 = " / ".join(
+                p.get("name", "?") for p in m.get("players", {}).get("team_1", [])
+            )
+            players_t2 = " / ".join(
+                p.get("name", "?") for p in m.get("players", {}).get("team_2", [])
+            )
+            score = format_match_score(m)
+            message += f"👥 {players_t1} vs {players_t2}\n📊 {score}\n⏱️ En juego\n\n"
+        return message
 
-    message = f"🎾 **Partidos en Vivo - Torneo {tournament_id}** 🎾\n\n"
-    for m in live_matches[:10]:  # mostramos solo los primeros 10
-        players_t1 = " / ".join(
-            p.get("name", "?") for p in m.get("players", {}).get("team_1", [])
-        )
-        players_t2 = " / ".join(
-            p.get("name", "?") for p in m.get("players", {}).get("team_2", [])
-        )
+    # 📅 Si no hay live, buscar partidos programados para hoy
+    today_str = datetime.utcnow().date().isoformat()
+    scheduled_today = [
+        m
+        for m in matches
+        if m.get("status") == "scheduled"
+        and m.get("scheduled_at", "").startswith(today_str)
+    ]
 
-        score = format_match_score(m)
-        message += f"👥 {players_t1} vs {players_t2}\n📊 {score}\n⏱️ En juego\n\n"
+    if scheduled_today:
+        message = f"📅 **Partidos Programados Hoy - Torneo {tournament_id}** 📅\n\n"
+        for m in scheduled_today[:10]:
+            players_t1 = " / ".join(
+                p.get("name", "?") for p in m.get("players", {}).get("team_1", [])
+            )
+            players_t2 = " / ".join(
+                p.get("name", "?") for p in m.get("players", {}).get("team_2", [])
+            )
+            when = m.get("scheduled_at", "Sin hora")
+            message += f"👥 {players_t1} vs {players_t2}\n🕒 Programado: {when}\n\n"
+        return message
 
-    return message
+    # 🚫 Nada disponible
+    return "⚠️ No hay partidos en curso ni programados para hoy en este torneo."
 
 
 async def get_last_results(summary_only: bool = True) -> str:
