@@ -827,8 +827,8 @@ async def main():
     print("El bot está en línea. Presiona Ctrl+C para detenerlo.")
 
     # ✅ async polling correcto
-    await application.run_polling()
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
