@@ -1,7 +1,6 @@
 import os
 from dotenv import load_dotenv
 import httpx
-import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -811,31 +810,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-# --- MAIN ---
-def main() -> None:
+async def main():
     print("Iniciando bot con alertas...")
-    asyncio.run(init_db())
 
+    # Crear aplicación
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Handlers principales
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, capture_player_name)
-    )
 
-    # Limpieza automática cada 24 horas
-    application.job_queue.run_repeating(
-        lambda ctx: cleanup_notified(), interval=86400, first=60
-    )
-
-    # Job de alertas cada 5 min
+    # Job de alertas
     job_queue = application.job_queue
-    job_queue.run_repeating(check_alerts, interval=1800, first=10)
+    job_queue.run_repeating(check_alerts, interval=60, first=10)
 
     print("El bot está en línea. Presiona Ctrl+C para detenerlo.")
-    application.run_polling()
+
+    # ✅ async polling correcto
+    await application.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
